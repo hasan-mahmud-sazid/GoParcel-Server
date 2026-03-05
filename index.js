@@ -80,7 +80,7 @@ async function run() {
         })
 
         // PAYMENT RELATED API'S -->
-
+        // CREATE NEW ->
         app.post('/payment-checkout-session', async (req, res) => {
             const paymentInfo = req.body;
             const amount = parseInt(paymentInfo.cost) * 100;
@@ -141,6 +141,28 @@ async function run() {
 
         })
 
+        // CHECK -->
+        app.patch('/payment-success', async (req, res) => {
+            const sessionId = req.query.session_id;
+
+            const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+            console.log('Session Retrieve : ', session);
+
+            if (session.payment_status === 'paid') {
+                const id = session.metadata.parcelId;
+                const query = { _id: new ObjectId(id) }
+                const update = {
+                    $set: {
+                        paymentStatus: 'paid',
+                    }
+                }
+                const result = await parcelsCollection.updateOne(query, update);
+                res.send(result);
+            }
+
+            res.send({ success: false })
+        })
 
         // Send a ping to confirm a successful connection
         await client.db("admin").command({ ping: 1 });
