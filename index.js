@@ -383,28 +383,6 @@ async function run() {
         }
       },
     );
-
-    // // server.js এর ভেতর এটি যোগ করুন
-    // app.get("/notifications/:email", verifyToken, async (req, res) => {
-    //   const email = req.params.email;
-
-    //   // সিকিউরিটির জন্য চেক করুন টোকেনের ইমেইল আর রিকোয়েস্টের ইমেইল এক কি না
-    //   if (req.user.email !== email) {
-    //     return res.status(403).send({ message: "forbidden access" });
-    //   }
-
-    //   const query = { userEmail: email };
-    //   try {
-    //     // নতুন নোটিফিকেশনগুলো আগে দেখানোর জন্য sort ব্যবহার করা হয়েছে
-    //     const result = await notificationsCollection
-    //       .find(query)
-    //       .sort({ date: -1 })
-    //       .toArray();
-    //     res.send(result);
-    //   } catch (error) {
-    //     res.status(500).send({ message: "Error fetching notifications" });
-    //   }
-    // });
     console.log("MongoDB Connected & Server Ready!");
   } catch (error) {
     console.error("Database Connection Error:", error);
