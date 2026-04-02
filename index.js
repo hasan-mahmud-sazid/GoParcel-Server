@@ -293,7 +293,7 @@ async function run() {
         // RIDER RELATED API --> 
         
         app.get('/riders', async(req, res) => {
-            const query = {}
+             const query = {}
             if( req.query.status ) {
                 query.status = req.query.status;
             }
@@ -301,7 +301,7 @@ async function run() {
             const result = await cursor.toArray();
             res.send(result);
 
-        })
+        }) 
         
         app.post('/riders', async(req, res) => {
             const rider = req.body;
@@ -311,6 +311,20 @@ async function run() {
             const result = await ridersCollection.insertOne(rider);
             res.send(result);
 
+        })
+
+        app.patch('/riders/:id', verifyFBToken, async(req, res) => {
+            const status = req.body.status;
+            const id = req.params.id;
+            const query = { _id: new ObjectId(id) }
+            const updatedDoc = {
+                $set : {
+                    status: status
+                }
+            }
+
+            const result = await ridersCollection.updateOne(query, updatedDoc);
+            res.send(result);
         })
 
         // Send a ping to confirm a successful connection
