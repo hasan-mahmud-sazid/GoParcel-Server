@@ -85,6 +85,14 @@ async function run() {
 
 
         // USER'S RELATED API'S -->
+
+        app.get('/users', verifyFBToken, async(req, res) => {
+            const cursor = userCollection.find();
+            const result = await cursor.toArray();
+            res.send(result);
+        })
+
+
         app.post('/users', async( req, res ) => {
             const user = req.body;
             user.role = 'user';
