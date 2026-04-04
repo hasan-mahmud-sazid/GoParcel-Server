@@ -417,7 +417,8 @@ async function run() {
             const query = { _id: new ObjectId(id) }
             const updatedDoc = {
                 $set: {
-                    status: status
+                    status: status,
+                    workStatus: 'available'
                 }
             }
 
