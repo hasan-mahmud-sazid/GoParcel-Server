@@ -84,6 +84,16 @@ async function run() {
         const ridersCollection = db.collection('riders');
 
 
+
+        // MIDDLEWARE WITH DATABASE ACCESS --> 
+
+        const verifyAdmin = async(req, res, next) => {
+            const email = req.decoded_email;
+
+
+            next();
+        }
+
         // USER'S RELATED API'S -->
 
         app.get('/users', verifyFBToken, async(req, res) => {
@@ -122,7 +132,7 @@ async function run() {
         })
 
 
-        app.patch('/users/:id', async(req, res ) => {
+        app.patch('/users/:id/role', verifyFBToken, async(req, res ) => {
             const id = req.params.id;
             const roleInfo = req.body;
             const query = { _id: new ObjectId(id) }
@@ -353,7 +363,7 @@ async function run() {
 
         })
 
-        app.patch('/riders/:id', verifyFBToken, async(req, res) => {
+        app.patch('/riders/:id', verifyFBToken,verifyAdmin, async(req, res) => {
             const status = req.body.status;
             const id = req.params.id;
             const query = { _id: new ObjectId(id) }
