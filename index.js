@@ -85,11 +85,17 @@ async function run() {
 
 
 
-        // MIDDLEWARE WITH DATABASE ACCESS --> 
+        // MIDDLEWARE ADMIN BEFORE ALLOWING ADMIN ACTION --> 
+        // MUST BE USED AFTER VERIFY'FB'TOKEN MIDDLEWARE --> 
 
         const verifyAdmin = async(req, res, next) => {
             const email = req.decoded_email;
+            const query = { email };
+            const user = await userCollection.findOne(query);
 
+            if( !user || user.role !== 'admin') {
+                return res.status(403).send({message: 'forbidden access' });
+            }
 
             next();
         }
@@ -132,7 +138,7 @@ async function run() {
         })
 
 
-        app.patch('/users/:id/role', verifyFBToken, async(req, res ) => {
+        app.patch('/users/:id/role', verifyFBToken, verifyAdmin, async(req, res ) => {
             const id = req.params.id;
             const roleInfo = req.body;
             const query = { _id: new ObjectId(id) }
@@ -363,7 +369,7 @@ async function run() {
 
         })
 
-        app.patch('/riders/:id', verifyFBToken,verifyAdmin, async(req, res) => {
+        app.patch('/riders/:id', verifyFBToken, verifyAdmin, async(req, res) => {
             const status = req.body.status;
             const id = req.params.id;
             const query = { _id: new ObjectId(id) }
