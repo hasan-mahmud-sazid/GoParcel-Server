@@ -11,9 +11,11 @@ const admin = require("firebase-admin");
 
 // Firebase Admin Setup
 const serviceAccount = require("./go-parcel-firebase-adminsdk.json");
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+  });
+}
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -32,18 +34,13 @@ const io = new Server(server, {
 });
 
 // Middleware
-app.use(cors());
+app.use(
+  cors({
+    origin: ["http://localhost:5173", "http://localhost:5174"],
+    credentials: true,
+  }),
+);
 app.use(express.json());
-
-// MongoDB Connection
-const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.zrfyfih.mongodb.net/?appName=Cluster0`;
-const client = new MongoClient(uri, {
-  serverApi: {
-    version: ServerApiVersion.v1,
-    strict: true,
-    deprecationErrors: true,
-  },
-});
 
 // --- HELPER FUNCTIONS ---
 function generateTrackingId() {
@@ -55,59 +52,74 @@ function generateTrackingId() {
 
 // --- MIDDLEWARES ---
 
-// 1. Verify Firebase Token (For Authentication)
-const verifyFBToken = async (req, res, next) => {
-  const token = req.headers.authorization;
-  if (!token) return res.status(401).send({ message: "unauthorized access" });
-
-  try {
-    const idToken = token.split(" ")[1];
-    const decoded = await admin.auth().verifyIdToken(idToken);
-    req.decoded_email = decoded.email;
-    next();
-  } catch (err) {
+// ১. টোকেন ভেরিফিকেশন (Firebase ID Token)
+const verifyToken = async (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return res.status(401).send({ message: "unauthorized access" });
   }
+  const token = authHeader.split(" ")[1];
+  try {
+    const decodedToken = await admin.auth().verifyIdToken(token);
+    req.decoded_email = decodedToken.email;
+    next();
+  } catch (error) {
+    console.error("Firebase Auth Error:", error.message);
+    return res.status(401).send({ message: "Invalid or Expired Token" });
+  }
 };
 
-// 2. Verify Admin (For Authorization)
-const verifyAdmin = async (req, res, next) => {
-  const email = req.decoded_email;
-  const db = client.db("go_parcel_db");
-  const user = await db.collection("users").findOne({ email });
-  if (!user || user.role !== "admin") {
-    return res.status(403).send({ message: "forbidden access" });
-  }
-  next();
-};
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@goparcel.o5leubt.mongodb.net/?appName=GoParcel`;
+const client = new MongoClient(uri, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
+});
 
 async function run() {
   try {
-    // await client.connect();
     const db = client.db("go_parcel_db");
     const userCollection = db.collection("users");
     const parcelsCollection = db.collection("parcels");
     const paymentCollection = db.collection("payments");
-    const ridersCollection = db.collection("riders");
     const notificationsCollection = db.collection("notifications");
+    const ridersCollection = db.collection("riders");
+    const parcelCollection = client.db("go_parcel_db").collection("parcels");
 
-    // Socket.io Connection
+    // ২. অ্যাডমিন ভেরিফিকেশন মিডলওয়্যার
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.decoded_email;
+      const user = await userCollection.findOne({ email });
+      if (!user || user.role !== "admin") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+      next();
+    };
+
+    // --- SOCKET.IO CONNECTION ---
     io.on("connection", (socket) => {
-      console.log("A user connected:", socket.id);
-      socket.on("disconnect", () => console.log("User disconnected"));
+      socket.on("join", (email) => {
+        socket.join(email);
+      });
     });
 
     // -----------------------
     // USERS API
     // -----------------------
-    app.get("/users", verifyFBToken, verifyAdmin, async (req, res) => {
-      const searchText = req.query.searchText;
+
+    // সব ইউজার ম্যানেজমেন্ট (অ্যাডমিনের জন্য)
+    app.get("/users", verifyToken, verifyAdmin, async (req, res) => {
+      const searchText = req.query.searchText || "";
       let query = {};
       if (searchText) {
-        query.$or = [
-          { displayName: { $regex: searchText, $options: "i" } },
-          { email: { $regex: searchText, $options: "i" } },
-        ];
+        query = {
+          $or: [
+            { displayName: { $regex: searchText, $options: "i" } },
+            { email: { $regex: searchText, $options: "i" } },
+          ],
+        };
       }
       const result = await userCollection
         .find(query)
@@ -116,12 +128,25 @@ async function run() {
       res.send(result);
     });
 
+    // ইউজারের রোল চেক করা
     app.get("/users/role/:email", async (req, res) => {
       const email = req.params.email;
       const user = await userCollection.findOne({ email });
       res.send({ role: user?.role || "user" });
     });
 
+    // ইউজার রোল আপডেট করা (Admin, Rider, User)
+    app.patch("/users/role/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const { role } = req.body;
+      const result = await userCollection.updateOne(
+        { _id: new ObjectId(id) },
+        { $set: { role: role } },
+      );
+      res.send(result);
+    });
+
+    // ইউজার সেভ করা (Login/Registration এর সময়)
     app.post("/users", async (req, res) => {
       const user = req.body;
       const query = { email: user.email };
@@ -135,68 +160,283 @@ async function run() {
     });
 
     // -----------------------
+    // RIDER MANAGEMENT API
+    // -----------------------
+    // --- RIDER MANAGEMENT APIs ---
+
+    // ১. রাইডার লিস্ট দেখার এপিআই (riders কালেকশন থেকে)
+    app.get("/admin/riders", verifyToken, verifyAdmin, async (req, res) => {
+      const ridersCollection = db.collection("riders");
+      const result = await ridersCollection.find().toArray();
+      res.send(result);
+    });
+
+    // ২. রাইডার এপ্রুভ করার এপিআই
+    // app.patch(
+    //   "/admin/riders/accept/:id",
+    //   verifyToken,
+    //   verifyAdmin,
+    //   async (req, res) => {
+    //     const id = req.params.id;
+    //     const ridersCollection = db.collection("riders");
+    //     const filter = { _id: new ObjectId(id) };
+
+    //     // riders কালেকশনে স্ট্যাটাস আপডেট
+    //     const result = await ridersCollection.updateOne(filter, {
+    //       $set: { riderStatus: "verified" },
+    //     });
+
+    //     // ঐ ইউজারকে 'users' কালেকশনেও 'rider' রোল দেওয়া
+    //     const riderInfo = await ridersCollection.findOne(filter);
+    //     if (riderInfo) {
+    //       await userCollection.updateOne(
+    //         { email: riderInfo.email },
+    //         { $set: { role: "rider" } },
+    //       );
+    //     }
+    //     res.send(result);
+    //   },
+    // );
+
+    // রাইডার স্ট্যাটাস এবং ইউজার রোল আপডেট করার এপিআই
+    app.patch("/riders/:id", verifyToken, verifyAdmin, async (req, res) => {
+      const id = req.params.id;
+      const { status, email } = req.body; // ফ্রন্টএন্ড থেকে স্ট্যাটাস এবং ইমেইল আসছে
+
+      const filter = { _id: new ObjectId(id) };
+      const riderUpdate = {
+        $set: { status: status },
+      };
+
+      // ১. রাইডার কালেকশন আপডেট
+      const result = await ridersCollection.updateOne(filter, riderUpdate);
+
+      // ২. যদি স্ট্যাটাস 'approved' হয়, তবে ইউজার কালেকশনে রোল আপডেট করুন
+      if (status === "approved") {
+        await userCollection.updateOne(
+          { email: email },
+          { $set: { role: "rider" } },
+        );
+      }
+
+      // যদি রিজেক্ট করা হয়, তবে রোল 'user' ই থাকবে (অথবা আপনার প্রয়োজন অনুযায়ী পরিবর্তন করতে পারেন)
+      if (status === "rejected") {
+        await userCollection.updateOne(
+          { email: email },
+          { $set: { role: "user" } },
+        );
+      }
+
+      res.send(result);
+    });
+
+    // ৩. রাইডার ব্যান করার এপিআই
+    app.patch(
+      "/admin/riders/ban/:id",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const id = req.params.id;
+        const ridersCollection = db.collection("riders");
+        const filter = { _id: new ObjectId(id) };
+
+        const result = await ridersCollection.updateOne(filter, {
+          $set: { riderStatus: "banned" },
+        });
+
+        // ব্যান করলে ইউজারের রোল আবার 'user' করে দেওয়া
+        const riderInfo = await ridersCollection.findOne(filter);
+        if (riderInfo) {
+          await userCollection.updateOne(
+            { email: riderInfo.email },
+            { $set: { role: "user" } },
+          );
+        }
+        res.send(result);
+      },
+    );
+
+    // Riders Api
+    app.post("/riders", verifyToken, async (req, res) => {
+      try {
+        const application = req.body;
+        const email = req.decoded_email;
+
+        // ১. riders কালেকশনে নতুন ডাটা ইনসার্ট করা
+        const applicationData = {
+          ...application,
+          email: email, // নিশ্চিত করার জন্য ইমেইলটি আবার সেট করা হলো
+          riderStatus: "pending",
+          appliedAt: new Date(),
+        };
+
+        const ridersCollection = client.db("go_parcel_db").collection("riders");
+        const insertResult = await ridersCollection.insertOne(applicationData);
+
+        // ২. userCollection-এ ইউজারের স্ট্যাটাস 'pending' করা (ঐচ্ছিক কিন্তু ভালো)
+        const filter = { email: email };
+        const updatedDoc = {
+          $set: {
+            riderStatus: "pending",
+            applicationId: insertResult.insertedId, // রেফারেন্সের জন্য আইডি রাখা
+          },
+        };
+        await client
+          .db("go_parcel_db")
+          .collection("users")
+          .updateOne(filter, updatedDoc);
+
+        // সব শেষে একবারই রেসপন্স পাঠানো
+        res.send(insertResult);
+      } catch (error) {
+        console.error("Error applying for rider:", error);
+        res.status(500).send({ message: "Application failed!" });
+      }
+    });
+    // -----------------------
     // PARCEL API
     // -----------------------
-    app.get("/parcels", verifyFBToken, async (req, res) => {
-      const { email, deliveryStatus } = req.query;
-      let query = {};
-      if (email) query.senderEmail = email;
-      if (deliveryStatus) query.deliveryStatus = deliveryStatus;
 
+    // ইউজারের নিজের পার্সেল লিস্ট
+    app.get("/parcels", verifyToken, async (req, res) => {
+      const { email } = req.query;
+      if (!email) return res.status(400).send({ message: "Email required" });
       const result = await parcelsCollection
-        .find(query)
-        .sort({ createdAt: -1 })
+        .find({ senderEmail: email })
         .toArray();
       res.send(result);
     });
 
-    app.post("/parcels", verifyFBToken, async (req, res) => {
+    // সব পার্সেল লিস্ট (Admin এর জন্য)
+    app.get("/all-parcels", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await parcelsCollection
+        .find()
+        .sort({ bookingDate: -1 })
+        .toArray();
+      res.send(result);
+    });
+
+    // পার্সেল বুকিং করা
+    app.post("/parcels", verifyToken, async (req, res) => {
       const parcelData = req.body;
       parcelData.deliveryStatus = "pending";
       parcelData.paymentStatus = "unpaid";
-      parcelData.createdAt = new Date();
+      parcelData.bookingDate = new Date();
       const result = await parcelsCollection.insertOne(parcelData);
       res.send(result);
     });
 
+    // ডেলিভারি ডেট আপডেট করা
     app.patch(
-      "/parcels/assign/:id",
-      verifyFBToken,
+      "/parcels/update-date/:id",
+      verifyToken,
       verifyAdmin,
       async (req, res) => {
-        const id = req.params.id;
-        const { riderId, riderName, riderEmail } = req.body;
+        const { deliveryDate } = req.body;
         const result = await parcelsCollection.updateOne(
-          { _id: new ObjectId(id) },
-          {
-            $set: {
-              deliveryStatus: "driver_assigned",
-              riderId: new ObjectId(riderId),
-              riderEmail,
-              riderName,
-            },
-          },
-        );
-        // Update rider status
-        await ridersCollection.updateOne(
-          { _id: new ObjectId(riderId) },
-          { $set: { workStatus: "in_delivery" } },
+          { _id: new ObjectId(req.params.id) },
+          { $set: { deliveryDate, deliveryStatus: "on-the-way" } },
         );
         res.send(result);
       },
     );
 
-    app.delete("/parcels/:id", verifyFBToken, async (req, res) => {
-      const result = await parcelsCollection.deleteOne({
-        _id: new ObjectId(req.params.id),
-      });
-      res.send(result);
+    app.patch("/parcels/assign/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const info = req.body;
+
+        // ১. চেক করা আইডিটি কি আদৌ ভ্যালিড?
+        if (!id || id === "undefined" || id.length !== 24) {
+          return res.status(400).send({ message: "Invalid or missing ID" });
+        }
+
+        const filter = { _id: new ObjectId(id) };
+        const updateDoc = {
+          $set: {
+            riderEmail: info.riderEmail,
+            approximateDeliveryDate: info.approximateDeliveryDate,
+            deliveryStatus: info.deliveryStatus,
+          },
+        };
+
+        const result = await parcelCollection.updateOne(filter, updateDoc);
+        res.send(result);
+      } catch (error) {
+        // ২. এরর হলে সার্ভার ক্র্যাশ না করে কনসোলে দেখাবে
+        console.error("Assign Error:", error.message);
+        res
+          .status(500)
+          .send({ message: "Internal Server Error", error: error.message });
+      }
     });
 
+    // রাইডার যখন পার্সেল একসেপ্ট করবে বা স্ট্যাটাস আপডেট করবে
+    app.patch("/parcels/:id/status", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const { deliveryStatus } = req.body;
+
+        if (!ObjectId.isValid(id)) {
+          return res.status(400).send({ message: "Invalid ID format" });
+        }
+
+        const filter = { _id: new ObjectId(id) };
+        const updateDoc = {
+          $set: { deliveryStatus: deliveryStatus },
+        };
+
+        // আপনার কোডে কালেকশনের নাম 'parcelCollection' ব্যবহার করা হয়েছে
+        const result = await parcelCollection.updateOne(filter, updateDoc);
+
+        if (result.modifiedCount > 0) {
+          res.send(result);
+        } else {
+          res
+            .status(404)
+            .send({ message: "Parcel not found or no changes made" });
+        }
+      } catch (error) {
+        console.error("Status Update Error:", error);
+        res.status(500).send({ message: "Internal Server Error" });
+      }
+    });
+
+    // রাইডার দ্বারা পার্সেল রিজেক্ট করার রুট
+    app.patch("/parcels/reject/:id", async (req, res) => {
+      try {
+        const id = req.params.id;
+        const filter = { _id: new ObjectId(id) };
+
+        // আপডেট ডাটা: স্ট্যাটাস পেন্ডিং হবে এবং রাইডারের তথ্য রিমুভ হবে
+        const updateDoc = {
+          $set: {
+            deliveryStatus: "pending",
+            riderEmail: null,
+            approximateDeliveryDate: null,
+          },
+          // যদি আপনি হিস্ট্রি রাখতে চান তবে $unset ব্যবহার করতে পারেন
+          // অথবা শুধু null সেট করলেই রাইডার ড্যাশবোর্ড থেকে এটি চলে যাবে
+        };
+
+        const result = await parcelCollection.updateOne(filter, updateDoc);
+
+        if (result.modifiedCount > 0) {
+          res.send(result);
+        } else {
+          res
+            .status(404)
+            .send({ message: "Parcel not found or no changes made" });
+        }
+      } catch (error) {
+        console.error("Reject Error:", error);
+        res.status(500).send({ message: "Internal Server Error" });
+      }
+    });
     // -----------------------
     // PAYMENT (STRIPE) API
     // -----------------------
-    app.post("/create-checkout-session", verifyFBToken, async (req, res) => {
+    app.post("/create-checkout-session", verifyToken, async (req, res) => {
       const { cost, parcelName, senderEmail, parcelId } = req.body;
       const amount = Math.round(parseFloat(cost) * 100);
 
@@ -213,8 +453,7 @@ async function run() {
           },
         ],
         mode: "payment",
-        customer_email: senderEmail,
-        metadata: { parcelId, parcelName },
+        metadata: { parcelId, senderEmail, parcelName },
         success_url: `${process.env.SITE_DOMAIN}/dashboard/payment-success?session_id={CHECKOUT_SESSION_ID}`,
         cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancelled`,
       });
@@ -223,58 +462,50 @@ async function run() {
 
     app.patch("/payment-success", async (req, res) => {
       const sessionId = req.query.session_id;
-      const session = await stripe.checkout.sessions.retrieve(sessionId);
+      try {
+        const session = await stripe.checkout.sessions.retrieve(sessionId);
+        if (session.payment_status === "paid") {
+          const existingPayment = await paymentCollection.findOne({
+            transactionId: session.payment_intent,
+          });
 
-      if (session.payment_status === "paid") {
-        const transactionId = session.payment_intent;
-        const parcelId = session.metadata.parcelId;
-        const trackingId = generateTrackingId();
+          if (existingPayment) {
+            return res.send({ success: true, message: "Already processed" });
+          }
+          const { parcelId, senderEmail, parcelName } = session.metadata; // মেটাডাটা থেকে নাম নিলেন
+          const trackingId = generateTrackingId();
 
-        // 1. Update Parcel Status
-        await parcelsCollection.updateOne(
-          { _id: new ObjectId(parcelId) },
-          {
-            $set: {
-              paymentStatus: "paid",
-              deliveryStatus: "pending-pickup",
-              trackingId,
+          await parcelsCollection.updateOne(
+            { _id: new ObjectId(parcelId) },
+            {
+              $set: {
+                paymentStatus: "paid",
+                deliveryStatus: "pending-pickup",
+                trackingId,
+              },
             },
-          },
-        );
+          );
 
-        // 2. Save Payment History
-        const payment = {
-          amount: session.amount_total / 100,
-          customerEmail: session.customer_email,
-          parcelId,
-          parcelName: session.metadata.parcelName,
-          transactionId,
-          trackingId,
-          paidAt: new Date(),
-        };
-        const result = await paymentCollection.insertOne(payment);
-        res.send({ success: true, trackingId, transactionId });
-      } else {
-        res.send({ success: false });
+          const payment = {
+            amount: session.amount_total / 100,
+            customerEmail: session.metadata.senderEmail,
+            parcelName: session.metadata.parcelName,
+            transactionId: session.payment_intent,
+            trackingId,
+            paidAt: new Date(),
+          };
+          await paymentCollection.insertOne(payment);
+          res.send({ success: true, trackingId });
+        }
+      } catch (err) {
+        res.status(500).send({ message: "Payment processing failed" });
       }
-    });
-
-    app.get("/payments", verifyFBToken, async (req, res) => {
-      const email = req.query.email;
-      if (email !== req.decoded_email)
-        return res.status(403).send({ message: "forbidden access" });
-
-      const result = await paymentCollection
-        .find({ customerEmail: email })
-        .sort({ paidAt: -1 })
-        .toArray();
-      res.send(result);
     });
 
     // -----------------------
     // ADMIN STATS
     // -----------------------
-    app.get("/admin-stats", verifyFBToken, verifyAdmin, async (req, res) => {
+    app.get("/admin-stats", verifyToken, verifyAdmin, async (req, res) => {
       const users = await userCollection.estimatedDocumentCount();
       const parcels = await parcelsCollection.estimatedDocumentCount();
       const payments = await paymentCollection.find().toArray();
@@ -282,7 +513,82 @@ async function run() {
       res.send({ users, parcels, revenue });
     });
 
-    console.log("Successfully connected to MongoDB!");
+    // ২. রাইডার লিস্ট দেখার এপিআই আপডেট করুন
+    app.get("/admin/riders", verifyToken, verifyAdmin, async (req, res) => {
+      const result = await ridersCollection.find().toArray();
+      res.send(result);
+    });
+
+    app.patch(
+      "/admin/riders/accept/:id",
+      verifyToken,
+      verifyAdmin,
+      async (req, res) => {
+        const id = req.params.id;
+        const filter = { _id: new ObjectId(id) };
+
+        // রাইডার কালেকশনে স্ট্যাটাস আপডেট
+        const result = await ridersCollection.updateOne(filter, {
+          $set: { riderStatus: "verified" },
+        });
+
+        // ঐ ইউজারকে 'users' কালেকশনেও 'rider' রোল দিয়ে আপডেট করতে হবে
+        const riderInfo = await ridersCollection.findOne(filter);
+        if (riderInfo) {
+          await userCollection.updateOne(
+            { email: riderInfo.email },
+            { $set: { role: "rider" } },
+          );
+        }
+
+        res.send(result);
+      },
+    );
+
+    // payments gets api
+    app.get("/payments", verifyToken, async (req, res) => {
+      const email = req.query.email;
+
+      // টোকেন এর ইমেইল আর কুয়েরি ইমেইল এক কিনা তা চেক করা (Security)
+      if (req.decoded_email !== email) {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+
+      const query = { customerEmail: email };
+      const result = await paymentCollection
+        .find(query)
+        .sort({ paidAt: -1 })
+        .toArray();
+      res.send(result);
+    });
+
+    // রাইডারের ইমেইল এবং স্ট্যাটাস অনুযায়ী পার্সেল খুঁজে বের করার রুট
+    app.get("/parcels/rider", async (req, res) => {
+      const email = req.query.riderEmail;
+      const status = req.query.deliveryStatus;
+
+      if (!email) {
+        return res.status(400).send({ message: "Rider email is required" });
+      }
+
+      const query = { riderEmail: email };
+      // যদি স্ট্যাটাস পাঠানো হয়, তবেই কুয়েরিতে যোগ হবে
+      if (status) {
+        query.deliveryStatus = status;
+      }
+
+      const result = await parcelCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    // ব্যাকএন্ডে রাইডারদের লিস্ট পাওয়ার রুট
+    app.get("/users/riders", async (req, res) => {
+      const query = { role: "rider" };
+      const result = await userCollection.find(query).toArray();
+      res.send(result);
+    });
+
+    console.log("Connected to MongoDB & Ready!");
   } finally {
   }
 }
